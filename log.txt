@@ -1,0 +1,14 @@
+SET k, 1, v, 1
+SET k, 1, v, 1
+SET k, 1, v, 1
+SET key, 3, value, 5
+SET key_0, 5, value_0, 7
+SET key_1, 5, value_1, 7
+SET key_2, 5, value_2, 7
+SET key_3, 5, value_3, 7
+SET key_4, 5, value_4, 7
+SET key_5, 5, value_5, 7
+SET key_6, 5, value_6, 7
+SET key_7, 5, value_7, 7
+SET key_8, 5, value_8, 7
+SET key_9, 5, value_9, 7
