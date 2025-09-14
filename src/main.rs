@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, env, fs::OpenOptions, io::Write};
+use std::{
+    collections::BTreeMap,
+    env,
+    fs::{self, OpenOptions},
+    io::Write,
+};
 
 // How to make value be anything -> trait use?
 
@@ -6,9 +11,16 @@ use std::{collections::BTreeMap, env, fs::OpenOptions, io::Write};
 fn main() {
     // Keys / values as strings
     // In-memory sotore (memtable) for access
+    let mut seq_num = 0; // (get the latest sequence number from a SEQ file)
     let mut hm = BTreeMap::new();
-    let mut seq_num = 0;
 
+    let mut log_dir = fs::read_dir(env::current_dir().expect("curr dir")).expect("show dir");
+    if log_dir.any(|path_result| path_result.unwrap().file_name() == "wal.log") {
+        // Load into the memtable
+        println!("Found an uncommited log")
+    }
+
+    // New log per new memtable
     let mut log_handle = OpenOptions::new()
         .read(true)
         .write(true)
@@ -17,7 +29,7 @@ fn main() {
         .open(
             env::current_dir()
                 .expect("Cwd not found")
-                .join("log.txt")
+                .join(format!("wal.log"))
                 .as_path(),
         )
         .expect("New log file error");
@@ -32,7 +44,7 @@ fn main() {
         assert!(key_len <= u8::MAX as usize);
         assert!(value_len <= u8::MAX as usize);
 
-        let log_entry = format!("SET {}, {}, {}, {}\n", k, key_len, v, value_len);
+        let log_entry = format!("SET {}, {}\n", k, v);
         log_handle
             .write_all(log_entry.as_bytes())
             .expect("Could not write contents");
@@ -54,7 +66,6 @@ fn main() {
                 .as_path(),
         )
         .expect("New log file error");
-    seq_num += 1;
 
     // Flush logic
     let mut buf = Vec::new();
@@ -68,6 +79,7 @@ fn main() {
     seg_handle
         .write_all(buf.as_slice())
         .expect("Unable to write");
+    seq_num += 1; // Write to SEQ -> now it's safe to disregard (and merge) older WALs
     hm.clear();
 
     // Merge segments
