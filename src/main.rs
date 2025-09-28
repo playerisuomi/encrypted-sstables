@@ -1,62 +1,76 @@
+use serde::{Serialize, de::DeserializeOwned};
 use std::{
     collections::BTreeMap,
-    env,
-    fs::{self, OpenOptions},
-    io::{Write, stdin},
+    env::{self},
+    fs::{self, File, OpenOptions, ReadDir},
+    io::{Read, Write, stdin},
+    ops::DerefMut,
     sync::{Arc, Mutex, mpsc},
     thread::{self},
 };
 
+// Keep short for testing
 const MAX_MEMTABLE: usize = 1 << 2;
 
-// How to make value be anything -> trait use?
+struct KvStore<K, V> {
+    memtable: BTreeMap<K, V>,
+}
+
+impl<K, V> KvStore<K, V>
+where
+    K: Ord + Serialize + DeserializeOwned,
+    V: Serialize + DeserializeOwned,
+{
+    fn new() -> Self {
+        Self {
+            memtable: BTreeMap::new(),
+        }
+    }
+}
 
 #[allow(unused_assignments)]
 fn main() {
-    let mut hm: BTreeMap<String, String> = BTreeMap::new();
+    let curr_dir = env::current_dir().expect("curr dir");
+
+    // Serializable K, V
+    let mut hm: KvStore<String, String> = KvStore::new();
     let (tx, rx) = mpsc::channel::<BTreeMap<String, String>>();
 
-    let mut log_dir = fs::read_dir(env::current_dir().expect("curr dir")).expect("show dir");
-    if log_dir.any(|path_result| path_result.unwrap().file_name() == "wal.log") {
-        // Load into the memtable
-        println!("Found an uncommited log")
+    if let Ok(mut file) = File::open(curr_dir.join("wal.log")) {
+        let mut buf = String::new();
+        file.read_to_string(&mut buf).unwrap();
+
+        for entry in buf.lines() {
+            let cmd_seq: Vec<_> = entry.split_whitespace().collect();
+            match cmd_seq[0] {
+                "SET" => {
+                    // Assumes right format
+                    hm.memtable
+                        .insert(cmd_seq[1].to_string(), cmd_seq[2].to_string());
+                }
+                _ => {}
+            }
+        }
     }
 
-    // TODO -> find a more efficient way (manifest file, etc)
-    // For now, get the seq num from the "latest" segment found
-    let latest_segment = fs::read_dir(env::current_dir().expect("curr dir"))
-        .expect("show dir")
-        .filter(|path_result| {
-            path_result
-                .as_ref()
-                .unwrap()
-                .file_name()
-                .as_os_str()
-                .to_str()
-                .unwrap()
-                .starts_with("segment")
-        })
-        .count();
+    let latest_segment = get_dir_segment_count(
+        fs::read_dir(env::current_dir().expect("curr dir")).expect("show dir"),
+    );
 
+    // Does this need to be behind a mutex?
     let seq_num: Arc<Mutex<usize>> = Arc::new(Mutex::new(latest_segment));
+    let log_handle = Arc::new(Mutex::new(
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .append(true) // Append-only
+            .create(true)
+            .open(curr_dir.join(format!("wal.log")).as_path())
+            .expect("New log file error"),
+    ));
 
-    // New log per new memtable -> TODO: into Arc<Mutex<>>
-    let mut log_handle = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .append(true) // Append-only
-        .create(true)
-        .open(
-            env::current_dir()
-                .expect("Cwd not found")
-                .join(format!("wal.log"))
-                .as_path(),
-        )
-        .expect("New log file error");
-
-    // SPAWN the background thread -> after initializing the data structures and loading them into memory
-    // Run until receives an exit signal!
-
+    let curr_dir_bg = curr_dir.clone();
+    let log_handle_bg = log_handle.clone();
     let _ = thread::spawn(move || {
         for flush_table in rx {
             // Flush to a new SSTable segment
@@ -66,14 +80,13 @@ fn main() {
                 .write(true)
                 .create(true)
                 .open(
-                    env::current_dir()
-                        .expect("Cwd not found")
+                    curr_dir_bg
                         .join(format!("segment_{}.sstable", seq_num))
                         .as_path(),
                 )
                 .expect("New log file error");
 
-            // Flush logic -> bytes vs. another encoding
+            // Flush -> bytes vs. other encoding?
             let mut buf = Vec::new();
             for (k, v) in flush_table.iter() {
                 let (key_len, value_len) = (k.len(), v.len());
@@ -86,7 +99,22 @@ fn main() {
             seg_handle
                 .write_all(buf.as_slice())
                 .expect("Unable to write");
-            seq_num += 1; // Write to SEQ -> now it's safe to disregard older WALs
+            seq_num += 1;
+
+            let mut log = log_handle_bg.lock().unwrap();
+
+            fs::remove_file(curr_dir_bg.join(format!("wal.log")).as_path()).unwrap();
+
+            let _ = std::mem::replace(
+                log.deref_mut(),
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .append(true)
+                    .create(true)
+                    .open(curr_dir_bg.join(format!("wal.log")).as_path())
+                    .expect("New log file error"),
+            );
 
             // Merge segments
             // ...
@@ -107,17 +135,19 @@ fn main() {
                 assert!(key_len <= u8::MAX as usize);
                 assert!(value_len <= u8::MAX as usize);
 
-                let log_entry = format!("SET {}, {}\n", k, v);
+                let log_entry = format!("SET {} {}\n", k, v);
                 log_handle
+                    .lock()
+                    .unwrap()
                     .write_all(log_entry.as_bytes())
                     .expect("Could not write contents");
 
-                hm.insert(k.to_string(), v.to_string());
+                hm.memtable.insert(k.to_string(), v.to_string());
 
                 let tx = tx.clone();
 
-                if hm.len() >= MAX_MEMTABLE {
-                    let flush_table = std::mem::replace(&mut hm, BTreeMap::new());
+                if hm.memtable.len() >= MAX_MEMTABLE {
+                    let flush_table = std::mem::take(&mut hm.memtable);
                     tx.send(flush_table).unwrap();
                 }
 
@@ -126,11 +156,13 @@ fn main() {
             "GET" => {
                 assert!(cmd_seq[1..].len() == 1);
 
-                if let Some(val) = hm.get(cmd_seq[1]) {
+                if let Some(val) = hm.memtable.get(cmd_seq[1]) {
                     println!("GET -> {}", val.clone())
                 } else {
                     // TODO: load segments -> algo for this?
-                    panic!("Not found in memory")
+                    // Idea is that the segments could be scanned concurrently (Tokio?)
+                    // If the segments are being merged, a concurrent worker has to wait -> acceptable
+                    todo!()
                 }
             }
             _ => {
@@ -138,4 +170,18 @@ fn main() {
             }
         }
     }
+}
+
+fn get_dir_segment_count(dir: ReadDir) -> usize {
+    dir.filter(|path_result| {
+        path_result
+            .as_ref()
+            .unwrap()
+            .file_name()
+            .as_os_str()
+            .to_str()
+            .unwrap()
+            .starts_with("segment")
+    })
+    .count()
 }
