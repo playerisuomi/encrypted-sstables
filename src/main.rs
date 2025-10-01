@@ -11,6 +11,7 @@ use std::{
 
 // Keep short for testing
 const MAX_MEMTABLE: usize = 1 << 2;
+const FOOTER_SIZE: usize = 1 << 2;
 
 struct KvStore<K, V> {
     memtable: BTreeMap<K, V>,
@@ -73,8 +74,6 @@ fn main() {
     let log_handle_bg = log_handle.clone();
     let _ = thread::spawn(move || {
         for flush_table in rx {
-            // Flush to a new SSTable segment
-            // [key_len][key...][value_len][value...]...
             let mut seq_num = seq_num.lock().unwrap().to_owned();
             let mut seg_handle = OpenOptions::new()
                 .write(true)
@@ -87,14 +86,30 @@ fn main() {
                 .expect("New log file error");
 
             // Flush -> bytes vs. other encoding?
+            let mut idx = Vec::new();
             let mut buf = Vec::new();
-            for (k, v) in flush_table.iter() {
+
+            for (i, (k, v)) in flush_table.iter().enumerate() {
                 let (key_len, value_len) = (k.len(), v.len());
-                buf.push(key_len as u8);
+                buf.extend_from_slice(&key_len.to_be_bytes());
                 buf.extend_from_slice(k.as_bytes());
-                buf.push(value_len as u8);
+                buf.extend_from_slice(&value_len.to_be_bytes());
                 buf.extend_from_slice(v.as_bytes());
+
+                if i % (flush_table.len() / 4) == 0 {
+                    // Sparse index
+                    idx.extend_from_slice(&key_len.to_be_bytes());
+                    idx.extend_from_slice(k.as_bytes());
+                    idx.extend_from_slice(&value_len.to_be_bytes());
+                    idx.extend_from_slice(v.as_bytes());
+                    idx.extend_from_slice(&i.to_be_bytes());
+                }
             }
+            let mut footer: Vec<u8> = vec![0; 4];
+            footer[0..4].copy_from_slice(&idx.len().to_be_bytes());
+            
+            buf.extend(&idx);
+            buf.extend_from_slice(&footer);
 
             seg_handle
                 .write_all(buf.as_slice())
@@ -117,7 +132,6 @@ fn main() {
             );
 
             // Merge segments
-            // ...
         }
     });
 
@@ -131,6 +145,8 @@ fn main() {
                 assert!(cmd_seq[1..].len() == 2);
                 let (k, v) = (cmd_seq[1], cmd_seq[2]);
                 let (key_len, value_len) = (k.len(), v.len());
+
+                // Lengths as bytes -> reading?
 
                 assert!(key_len <= u8::MAX as usize);
                 assert!(value_len <= u8::MAX as usize);
@@ -159,9 +175,7 @@ fn main() {
                 if let Some(val) = hm.memtable.get(cmd_seq[1]) {
                     println!("GET -> {}", val.clone())
                 } else {
-                    // TODO: load segments -> algo for this?
-                    // Idea is that the segments could be scanned concurrently (Tokio?)
-                    // If the segments are being merged, a concurrent worker has to wait -> acceptable
+                    // Assume no merging / compaction in the beginning!
                     todo!()
                 }
             }
