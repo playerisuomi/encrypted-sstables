@@ -1,7 +1,7 @@
 use anyhow::Result;
-use serde::{Serialize, de::DeserializeOwned};
 use std::io::Seek;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::{
     collections::BTreeMap,
     env::{self},
@@ -14,23 +14,43 @@ use std::{
     vec,
 };
 
-// Keep short for testing
 const MAX_MEMTABLE: usize = 1 << 2;
 const FOOTER_SIZE: usize = 1 << 4;
 
-struct KvStore<K, V> {
-    memtable: BTreeMap<K, V>,
+struct KvStore<V> {
+    memtable: BTreeMap<String, V>,
 }
 
-impl<K, V> KvStore<K, V>
+impl<V> KvStore<V>
 where
-    K: Ord + Serialize + DeserializeOwned,
-    V: Serialize + DeserializeOwned,
+    V: FromStr, // Serialize + Deserialize
 {
     fn new() -> Self {
         Self {
             memtable: BTreeMap::new(),
         }
+    }
+
+    fn sync_wal(&mut self, mut file: File) -> Result<()>
+    where
+        V: FromStr,
+        <V as FromStr>::Err: std::fmt::Debug,
+    {
+        let mut buf = String::new();
+        file.read_to_string(&mut buf).unwrap();
+
+        for entry in buf.lines() {
+            let cmd_seq: Vec<_> = entry.split_whitespace().collect();
+            match cmd_seq[0] {
+                "SET" => {
+                    if let Ok(value) = cmd_seq[2].parse::<V>() {
+                        self.memtable.insert(cmd_seq[1].to_string(), value);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 }
 
@@ -47,6 +67,28 @@ impl SegmentIter {
             seg_ids: seg_ids,
             origin: origin_path,
         }
+    }
+
+    fn find_key_in_segments(self, key: &str) -> Result<Option<String>> {
+        for mut seg in self {
+            let mut key_offset: u64 = 0;
+            for (k, v) in seg.idx.iter() {
+                match k.as_str().cmp(key) {
+                    std::cmp::Ordering::Greater => break,
+                    std::cmp::Ordering::Equal => {
+                        key_offset = *v;
+                        break;
+                    }
+                    std::cmp::Ordering::Less => {
+                        key_offset = *v;
+                    }
+                }
+            }
+            if let Ok(Some(v)) = seg.search(key, key_offset) {
+                return Ok(Some(v));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -73,7 +115,6 @@ impl Iterator for SegmentIter {
 
             let mut seg = SegmentFile::new(offset, seg_file);
             seg.populate_index(idx).unwrap();
-            self.curr -= 1;
 
             return Some(seg);
         }
@@ -96,18 +137,53 @@ impl SegmentFile<String, u64> {
         }
     }
 
+    fn search(&mut self, k: &str, key_offset: u64) -> Result<Option<String>> {
+        self.seg_handle.seek(std::io::SeekFrom::Start(key_offset))?;
+        loop {
+            if self.seg_handle.stream_position()? >= self.idx_offset {
+                return Ok(None);
+            }
+
+            let mut key_len_bytes: [u8; 4] = [0; 4];
+            self.seg_handle.read_exact(&mut key_len_bytes)?;
+
+            let key_len = u32::from_be_bytes(key_len_bytes);
+            let mut key_bytes = vec![0; key_len as usize];
+            self.seg_handle.read_exact(&mut key_bytes)?;
+
+            let mut value_len_bytes: [u8; 4] = [0; 4];
+            self.seg_handle.read_exact(&mut value_len_bytes)?;
+
+            let value_len = u32::from_be_bytes(value_len_bytes);
+            let mut value_bytes = vec![0; value_len as usize];
+            self.seg_handle.read_exact(&mut value_bytes)?;
+
+            let key = String::from_utf8(key_bytes)?;
+            let value = String::from_utf8(value_bytes)?;
+
+            if key.as_str() == k {
+                return Ok(Some(value));
+            }
+            if key.as_str() > k {
+                return Ok(None);
+            }
+        }
+    }
+
     fn populate_index(&mut self, idx_bytes: Vec<u8>) -> Result<()> {
         let mut idx_cursor = &idx_bytes[..];
         while !idx_cursor.is_empty() {
             let mut key_len_bytes: [u8; 4] = [0; 4];
             idx_cursor.read_exact(&mut key_len_bytes)?;
+
             let key_len = u32::from_be_bytes(key_len_bytes);
             let mut key_bytes = vec![0; key_len as usize];
             idx_cursor.read_exact(&mut key_bytes)?;
+
             let mut offset_bytes: [u8; 8] = [0; 8];
             idx_cursor.read_exact(&mut offset_bytes)?;
-            let offset = u64::from_be_bytes(offset_bytes);
 
+            let offset = u64::from_be_bytes(offset_bytes);
             self.idx
                 .insert(String::from_utf8(key_bytes)?.into(), offset);
         }
@@ -132,29 +208,16 @@ impl SegmentFile<String, u64> {
 fn main() {
     let curr_dir = env::current_dir().expect("curr dir");
     // Serializable K, V
-    let mut hm: KvStore<String, String> = KvStore::new();
+    let mut hm: KvStore<String> = KvStore::new();
     let (tx, rx) = mpsc::channel::<BTreeMap<String, String>>();
 
-    if let Ok(mut file) = File::open(curr_dir.join("wal.log")) {
-        let mut buf = String::new();
-        file.read_to_string(&mut buf).unwrap();
-
-        for entry in buf.lines() {
-            let cmd_seq: Vec<_> = entry.split_whitespace().collect();
-            match cmd_seq[0] {
-                "SET" => {
-                    hm.memtable
-                        .insert(cmd_seq[1].to_string(), cmd_seq[2].to_string());
-                }
-                _ => {}
-            }
-        }
+    if let Ok(file) = File::open(curr_dir.join("wal.log")) {
+        hm.sync_wal(file).unwrap();
     }
-
     let latest_segment = get_dir_segment_count(
         fs::read_dir(env::current_dir().expect("curr dir")).expect("show dir"),
     );
-    // Does this need to be behind a mutex?
+
     let seg_num: Arc<Mutex<usize>> = Arc::new(Mutex::new(latest_segment));
     let log_handle = Arc::new(Mutex::new(
         OpenOptions::new()
@@ -271,66 +334,16 @@ fn main() {
             }
             "GET" => {
                 assert!(cmd_seq[1..].len() == 1);
-
                 if let Some(val) = hm.memtable.get(cmd_seq[1]) {
                     println!("GET -> {}", val.clone())
                 } else {
-                    // Assume no merging / compaction in the beginning!
-                    let curr_seg = seg_num.lock().unwrap().clone() - 1;
+                    let curr_seg = seg_num.lock().unwrap().clone();
                     let seg_iter =
                         SegmentIter::new((0..curr_seg).into_iter().collect(), curr_dir.clone());
-
-                    'outer: for mut seg in seg_iter {
-                        let mut key_offset: u64 = 0;
-                        for (k, v) in seg.idx.iter() {
-                            match k.as_str().cmp(cmd_seq[1]) {
-                                std::cmp::Ordering::Greater => break,
-                                std::cmp::Ordering::Equal => {
-                                    key_offset = *v;
-                                    break;
-                                }
-                                std::cmp::Ordering::Less => {
-                                    key_offset = *v;
-                                }
-                            }
-                        }
-                        seg.seg_handle
-                            .seek(std::io::SeekFrom::Start(key_offset))
-                            .unwrap();
-
-                        loop {
-                            let current_position = seg.seg_handle.stream_position().unwrap();
-                            if current_position >= seg.idx_offset {
-                                println!("Key not found");
-                                break 'outer;
-                            }
-                            let mut key_len_bytes: [u8; 4] = [0; 4];
-                            seg.seg_handle.read_exact(&mut key_len_bytes).unwrap();
-                            let key_len = u32::from_be_bytes(key_len_bytes);
-
-                            let mut key_bytes = vec![0; key_len as usize];
-                            seg.seg_handle.read_exact(&mut key_bytes).unwrap();
-
-                            let mut value_len_bytes: [u8; 4] = [0; 4];
-                            seg.seg_handle.read_exact(&mut value_len_bytes).unwrap();
-
-                            let value_len = u32::from_be_bytes(value_len_bytes);
-                            let mut value_bytes = vec![0; value_len as usize];
-                            seg.seg_handle.read_exact(&mut value_bytes).unwrap();
-
-                            // Assuming just String keys and values for now!
-                            let key = String::from_utf8(key_bytes).unwrap();
-                            let value = String::from_utf8(value_bytes).unwrap();
-
-                            if key.as_str() == cmd_seq[1] {
-                                println!("Found pair: {key}: {value}");
-                                break 'outer;
-                            }
-                            if key.as_str() > cmd_seq[1] {
-                                println!("Key not found");
-                                break 'outer;
-                            }
-                        }
+                    if let Ok(Some(value)) = seg_iter.find_key_in_segments(cmd_seq[1]) {
+                        println!("GET -> {}", value)
+                    } else {
+                        println!("Not found")
                     }
                 }
             }

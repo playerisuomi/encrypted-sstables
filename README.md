@@ -10,10 +10,11 @@
 ### Next
 
 - _Merge segments_
-- KvStore methods separated -> clean up
+- _KvStore methods separated_
 - Error propagation with `Results`
   - KvError
 - Tests to populate the memtable (and write segments)
+- Edge case functionality, more serializable K and V types?
 - _More effecive way of getting the latest segment?_
 
 ### Crypto
