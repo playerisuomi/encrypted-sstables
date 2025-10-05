@@ -10,14 +10,14 @@
 ### Next
 
 - _Merge segments_
-- Scan the segments efficiently on a read-through (key not in memory) (1/2)
 - KvStore methods separated -> clean up
 - Error propagation with `Results`
   - KvError
+- Tests to populate the memtable (and write segments)
 - _More effecive way of getting the latest segment?_
 
 ### Crypto
 
-- Encrypted logs / segments
+- Encrypted logs / segments (articles on this?)
 - Decrpyted in memory
 - ...
