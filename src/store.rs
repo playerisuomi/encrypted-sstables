@@ -54,4 +54,13 @@ where
         }
         Ok(())
     }
+
+    pub fn insert_parsed(&mut self, key: String, value: String) -> Result<(), KvError> {
+        if let Ok(value) = value.parse::<V>() {
+            self.memtable.insert(key, value);
+        } else {
+            return Err(KvError("insert"));
+        }
+        return Ok(());
+    }
 }

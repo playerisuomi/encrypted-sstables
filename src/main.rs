@@ -1,7 +1,14 @@
 use anyhow::Result;
+use argon2::Argon2;
+use argon2::PasswordHasher;
+use argon2::password_hash::{SaltString, rand_core::OsRng};
+use enc_kv_store::NoncePlaceholder;
 use enc_kv_store::segment::SegmentIter;
 use enc_kv_store::store::{KvError, KvStore};
 use enc_kv_store::{FOOTER_SIZE, MAX_MEMTABLE};
+use ring::aead;
+use ring::aead::BoundKey;
+use std::sync::LazyLock;
 use std::{
     collections::BTreeMap,
     env::{self},
@@ -13,11 +20,31 @@ use std::{
     vec,
 };
 
+static SALT: LazyLock<SaltString> = std::sync::LazyLock::new(|| SaltString::generate(&mut OsRng));
+
 #[allow(unused_assignments)]
 fn main() -> Result<(), KvError> {
+    let args: Vec<String> = env::args().collect();
+    assert!(args.len() <= 2);
+
+    // Handle!
+    let password = args.get(1).unwrap();
+    println!("{password}");
+
     let curr_dir = env::current_dir().expect("curr dir");
+
+    // TODO: KvStore to take an encrypter as a field?
+    // KvStore to hold the key!
     let mut hm: KvStore<String> = KvStore::new();
     let (tx, rx) = mpsc::channel::<BTreeMap<String, String>>();
+
+    // Note: Handle errors
+    let argon2 = Argon2::default();
+    // Store in a Mutex?
+    let key = argon2
+        .hash_password(password.as_bytes(), SALT.as_salt())
+        .unwrap();
+    let key_mut = Arc::new(Mutex::new(key));
 
     if let Ok(file) = File::open(curr_dir.join("wal.log")) {
         hm.sync_wal(file).unwrap();
@@ -40,6 +67,7 @@ fn main() -> Result<(), KvError> {
     let curr_dir_bg = curr_dir.clone();
     let log_handle_bg = log_handle.clone();
     let seg_bg = seg_num.clone();
+    let key_bg = key_mut.clone();
 
     let _ = thread::spawn(move || {
         for flush_table in rx {
@@ -60,12 +88,34 @@ fn main() -> Result<(), KvError> {
             for (i, (k, v)) in flush_table.iter().enumerate() {
                 let offset = buf.len() as u64; // could be u32
 
-                let (key_len, value_len): (u32, u32) =
-                    (k.as_bytes().len() as u32, v.as_bytes().len() as u32);
+                // TODO: Serde serialization -> derive Serialize and DeserializeOwned
+                // More generic method to serialize the value! -> might not be a String
+
+                let nonce = NoncePlaceholder::new();
+
+                // Handle! -> separate later
+                let key_mut = key_bg.lock().unwrap().hash.unwrap();
+                let key_bytes = key_mut.as_bytes();
+
+                let u_key = aead::UnboundKey::new(&aead::AES_256_GCM, key_bytes).unwrap();
+                let mut sealing_key = aead::SealingKey::new(u_key, nonce.clone());
+
+                let mut sealed_value: Vec<u8> = Vec::from(v.as_bytes());
+                sealing_key
+                    .seal_in_place_append_tag(aead::Aad::from(k.as_bytes()), &mut sealed_value)
+                    .expect("sealing");
+
+                let key_len: u32 = k.as_bytes().len() as u32;
+                let cipher_len: u32 = sealed_value.len() as u32;
+
                 buf.extend_from_slice(&key_len.to_be_bytes());
                 buf.extend_from_slice(k.as_bytes());
-                buf.extend_from_slice(&value_len.to_be_bytes());
-                buf.extend_from_slice(v.as_bytes());
+
+                // Nonce (12)
+                buf.extend_from_slice(&nonce.n);
+                // Cipher (..)
+                buf.extend_from_slice(&cipher_len.to_be_bytes());
+                buf.extend_from_slice(sealed_value.as_slice());
 
                 if i % (flush_table.len() / 2) == 0 {
                     // Sparse index
@@ -75,9 +125,19 @@ fn main() -> Result<(), KvError> {
                     idx.extend_from_slice(&offset.to_be_bytes());
                 }
             }
+            // Key hash into the footer as plaintext
+            // len from 10 bytes to 64 bytes -> reserve 64 for now?
+
             let mut footer: Vec<u8> = vec![0; FOOTER_SIZE];
-            footer[0..FOOTER_SIZE / 2].copy_from_slice(&buf.len().to_be_bytes());
-            footer[FOOTER_SIZE / 2..FOOTER_SIZE].copy_from_slice(&idx.len().to_be_bytes());
+            // usize -> 8 bytes
+            footer[0..8].copy_from_slice(&buf.len().to_be_bytes());
+            footer[8..16].copy_from_slice(&idx.len().to_be_bytes());
+
+            // Salt length is 16 bytes ????
+            let mut salt_bytes: [u8; 16] = [0u8; 16];
+            SALT.decode_b64(&mut salt_bytes)
+                .expect("salt decoding into bytes");
+            footer[16..].copy_from_slice(&salt_bytes);
 
             buf.extend(&idx);
             buf.extend_from_slice(&footer);
@@ -120,6 +180,7 @@ fn main() -> Result<(), KvError> {
                 assert!(key_len <= u8::MAX as usize);
                 assert!(value_len <= u8::MAX as usize);
 
+                // TODO: encryption here!
                 let log_entry = format!("SET {} {}\n", k, v);
                 log_handle
                     .lock()
@@ -127,12 +188,13 @@ fn main() -> Result<(), KvError> {
                     .write_all(log_entry.as_bytes())
                     .expect("Could not write contents");
 
-                hm.memtable.insert(k.to_string(), v.to_string());
+                // Parsed into V (FromStr)
+                hm.insert_parsed(k.to_string(), v.to_string())?;
 
                 let tx = tx.clone();
 
                 if hm.memtable.len() >= MAX_MEMTABLE {
-                    let flush_table = std::mem::take(&mut hm.memtable);
+                    let flush_table: BTreeMap<String, _> = std::mem::take(&mut hm.memtable);
                     tx.send(flush_table).unwrap();
                 }
 
@@ -144,8 +206,12 @@ fn main() -> Result<(), KvError> {
                     println!("GET -> {}", val.clone())
                 } else {
                     let curr_seg = seg_num.lock().unwrap().clone();
-                    let seg_iter =
-                        SegmentIter::new((0..curr_seg).into_iter().collect(), curr_dir.clone());
+                    // TODO: a decrypter struct for SegmentIter -> centralized decrpytion logic?
+                    let seg_iter = SegmentIter::new(
+                        (0..curr_seg).into_iter().collect(),
+                        curr_dir.clone(),
+                        password.to_owned(),
+                    );
                     if let Ok(Some(value)) = seg_iter.find_key_in_segments(cmd_seq[1]) {
                         println!("GET -> {}", value)
                     } else {
