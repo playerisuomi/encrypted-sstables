@@ -1,25 +1,33 @@
+use anyhow::Result;
+use argon2::Argon2;
+use argon2::PasswordHasher;
+use argon2::password_hash::Output;
+use argon2::password_hash::SaltString;
+use ring::aead;
+use ring::aead::BoundKey;
 use std::io::Read;
 use std::io::Seek;
 use std::os::windows::fs::FileExt;
 use std::{collections::BTreeMap, fs::File, path::PathBuf};
 
-use anyhow::Result;
-
 use crate::FOOTER_SIZE;
+use crate::NoncePlaceholder;
 
 #[derive(Debug, Clone)]
 pub struct SegmentIter {
     curr: usize,
     seg_ids: Vec<usize>,
     origin: PathBuf,
+    password: String, // Decrypter should take care of this?
 }
 
 impl SegmentIter {
-    pub fn new(seg_ids: Vec<usize>, origin_path: PathBuf) -> Self {
+    pub fn new(seg_ids: Vec<usize>, origin_path: PathBuf, password: String) -> Self {
         Self {
             curr: seg_ids.len(),
             seg_ids: seg_ids,
             origin: origin_path,
+            password: password,
         }
     }
 
@@ -61,13 +69,19 @@ impl Iterator for SegmentIter {
             .join(format!("segment_{}.sstable", self.seg_ids[self.curr]));
 
         if let Ok(mut seg_file) = File::open(seg_path) {
-            let (offset, size) = SegmentFile::parse_footer(&mut seg_file).unwrap();
+            let (offset, size, salt) = SegmentFile::parse_footer(&mut seg_file).unwrap();
             let mut idx: Vec<u8> = vec![0; size.try_into().unwrap()];
 
             let n = seg_file.seek_read(&mut idx, offset).unwrap();
             assert_eq!(size, n.try_into().unwrap());
 
-            let mut seg = SegmentFile::new(offset, seg_file);
+            // Decrypter responsib.
+            let argon2 = Argon2::default();
+            let key = argon2
+                .hash_password(self.password.as_bytes(), salt.as_salt())
+                .expect("rederive key");
+
+            let mut seg = SegmentFile::new(offset, seg_file, key.hash.expect("key hash"));
             seg.populate_index(idx).unwrap();
 
             return Some(seg);
@@ -81,14 +95,16 @@ pub struct SegmentFile<K, V> {
     seg_handle: File,
     idx_offset: u64,
     idx: BTreeMap<K, V>,
+    key: Output,
 }
 
 impl SegmentFile<String, u64> {
-    pub fn new(offset: u64, seg_file: File) -> Self {
+    pub fn new(offset: u64, seg_file: File, key: Output) -> Self {
         Self {
             idx: BTreeMap::new(),
             idx_offset: offset,
             seg_handle: seg_file,
+            key: key,
         }
     }
 
@@ -98,7 +114,6 @@ impl SegmentFile<String, u64> {
             if self.seg_handle.stream_position()? >= self.idx_offset {
                 return Ok(None);
             }
-
             let mut key_len_bytes: [u8; 4] = [0; 4];
             self.seg_handle.read_exact(&mut key_len_bytes)?;
 
@@ -106,16 +121,28 @@ impl SegmentFile<String, u64> {
             let mut key_bytes = vec![0; key_len as usize];
             self.seg_handle.read_exact(&mut key_bytes)?;
 
-            let mut value_len_bytes: [u8; 4] = [0; 4];
-            self.seg_handle.read_exact(&mut value_len_bytes)?;
+            let mut nonce_bytes: [u8; 12] = [0; 12];
+            self.seg_handle.read_exact(&mut nonce_bytes)?;
 
-            let value_len = u32::from_be_bytes(value_len_bytes);
-            let mut value_bytes = vec![0; value_len as usize];
-            self.seg_handle.read_exact(&mut value_bytes)?;
+            let mut enc_bytes_len: [u8; 4] = [0; 4];
+            self.seg_handle.read_exact(&mut enc_bytes_len)?;
+            let enc_len = u32::from_be_bytes(enc_bytes_len);
+            let mut enc_bytes = vec![0; enc_len as usize];
+            self.seg_handle.read_exact(&mut enc_bytes)?;
+
+            // Decryption -> separate
+            let nonce = NoncePlaceholder::from_bytes(nonce_bytes);
+            let aad = aead::Aad::from(&key_bytes);
+            let u_key = aead::UnboundKey::new(&aead::AES_256_GCM, self.key.as_bytes()).unwrap();
+            let mut opening_key = aead::OpeningKey::new(u_key, nonce.clone());
+            let plaintext_slice = opening_key
+                .open_in_place(aad, &mut enc_bytes)
+                .expect("decryption");
 
             // Strings assumed for now?
+            // TODO: Serde deserialize!
             let key = String::from_utf8(key_bytes)?;
-            let value = String::from_utf8(value_bytes)?;
+            let value = String::from_utf8(Vec::from(plaintext_slice))?;
 
             if key.as_str() == k {
                 return Ok(Some(value));
@@ -146,16 +173,20 @@ impl SegmentFile<String, u64> {
         Ok(())
     }
 
-    fn parse_footer(seg_file: &mut File) -> Result<(u64, u64)> {
+    fn parse_footer(seg_file: &mut File) -> Result<(u64, u64, SaltString)> {
         let seg_size = seg_file.metadata()?.len();
 
         let mut footer_bytes: [u8; FOOTER_SIZE] = [0; FOOTER_SIZE];
         let footer_offset = (seg_size as usize - FOOTER_SIZE) as u64;
         seg_file.seek_read(&mut footer_bytes[0..FOOTER_SIZE], footer_offset)?;
 
-        let idx_offset = u64::from_be_bytes(footer_bytes[0..FOOTER_SIZE / 2].try_into()?);
-        let idx_size = u64::from_be_bytes(footer_bytes[FOOTER_SIZE / 2..FOOTER_SIZE].try_into()?);
+        let idx_offset = u64::from_be_bytes(footer_bytes[0..8].try_into()?);
+        let idx_size = u64::from_be_bytes(footer_bytes[8..16].try_into()?);
 
-        Ok((idx_offset, idx_size))
+        // Salt
+        let salt_bytes = &footer_bytes[16..32];
+        let salt = SaltString::encode_b64(salt_bytes).expect("encode salt back to string");
+
+        Ok((idx_offset, idx_size, salt))
     }
 }
