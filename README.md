@@ -1,5 +1,13 @@
 # enc-kv-store
 
+A learning experience for someone interested in Rust, systems concepts and cryptography.
+
+### Testing
+
+```
+cargo run -- password
+```
+
 ### Notes
 
 - Only able to access the segments that were decrypted with a certain password!
@@ -12,8 +20,10 @@
 
 - _Merge segments_
 - **Serde byte serialization**
-- Encryption into a module / layer consumed by the app / store?
+- Log encryption
+- _App module for stdin loop?_
 - Logging
+- _Aligned errors_
 - _Verify the loaded key against the saved key -> save the key hash?_
-- Tests to populate the memtable (and write segments)
+- Tests to populate the memtable (and write segments) / encryption
   - Edge case functionality?
