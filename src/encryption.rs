@@ -101,7 +101,7 @@ impl Encrypter for DefaultEncrypter {
         assert!(aad.is_some());
 
         sealing_key.seal_in_place_append_tag(aead::Aad::from(aad.unwrap()), data_in_place)?;
-        Ok(nonce.n.clone())
+        Ok(nonce.n)
     }
 }
 

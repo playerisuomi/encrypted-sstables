@@ -22,13 +22,12 @@ static DEFAULT: Lazy<String> = Lazy::new(|| String::from("password"));
 #[allow(unused_assignments)]
 fn main() -> Result<(), KvError> {
     let args: Vec<String> = env::args().collect();
-    assert!(args.len() <= 2);
 
-    // Config?
     let password = args.get(1).unwrap_or(&DEFAULT);
     let curr_dir = env::current_dir().expect("curr dir");
 
     let encrypter = DefaultEncrypter::new(password.to_owned()).expect("no default encryption");
+    // Could also just be a ref to the "main" encrypter instance -> figure out when modularizing the app loop
     let mut hm: KvStore<String> = KvStore::new(encrypter.clone());
     let (tx, rx) = mpsc::channel::<BTreeMap<String, String>>();
 

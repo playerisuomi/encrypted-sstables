@@ -1,27 +1,36 @@
 # enc-kv-store
 
-A learning experience for someone interested in Rust, systems concepts and cryptography.
+A little learning project in Rust, systems concepts and cryptography.
 
-### Testing
+## Testing
 
-```
+#### Commands
+
+```powershell
 cargo run -- password
 ```
 
-### Notes
+#### Commands
 
-- Only able to access the segments that were decrypted with a certain password!
-- SSTables -> background thread(pool) to merge?
+```powershell
+SET <key> <value>
+GET <key>
+```
+
+## Notes
+
+- Only able to access the segments that were decrypted with a certain password
+- SSTables -> background thread(pool) to merge
 - Main loop (on main thread) that listens for commands -> performs writes / reads with locks (`Arc<Mutex>`)
 - Background thread handles compaction and flushing (job queue)
-  - Sleeps (_Condvar_) and listens for signals (_mpsc_)
 
-### Next
+## Next
 
 - **Logging**
 - **Serde byte serialization**
+- Configuration
 - _Merge segments_
-- _App module for stdin loop?_
-- _Verify the loaded key against the saved key -> save the key hash?_
+- _App module for stdin loop_
+- _Verify the loaded key against the saved key -> save the key hash_
 - Tests to populate the memtable (and write segments) / encryption
-  - Edge case functionality?
+  - Edge case functionality
