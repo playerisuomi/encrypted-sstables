@@ -18,12 +18,11 @@ cargo run -- password
 
 ### Next
 
-- _Merge segments_
+- **Logging**
 - **Serde byte serialization**
-- Log encryption
+- **Log encryption**
+- _Merge segments_
 - _App module for stdin loop?_
-- Logging
-- _Aligned errors_
 - _Verify the loaded key against the saved key -> save the key hash?_
 - Tests to populate the memtable (and write segments) / encryption
   - Edge case functionality?

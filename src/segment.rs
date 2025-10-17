@@ -122,13 +122,11 @@ impl SegmentFile<String, u64> {
             self.seg_handle.read_exact(&mut enc_bytes)?;
 
             let key = String::from_utf8(key_bytes.clone())?;
-
             if key.as_str() == k {
                 let plaintext_slice = self
                     .decrypter
                     .decrypt(&mut enc_bytes, nonce_bytes, &mut key_bytes)
                     .expect("no access");
-
                 // TODO: Serde deserialize!
                 let value = String::from_utf8(Vec::from(plaintext_slice))?;
                 return Ok(Some(value));

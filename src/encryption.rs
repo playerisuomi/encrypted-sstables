@@ -13,7 +13,8 @@ use ring::aead::BoundKey;
 use ring::aead::{self, NonceSequence};
 use ring::error::Unspecified;
 
-static SALT: LazyLock<SaltString> = std::sync::LazyLock::new(|| SaltString::generate(&mut OsRng));
+pub static SALT: LazyLock<SaltString> =
+    std::sync::LazyLock::new(|| SaltString::generate(&mut OsRng));
 
 #[derive(Debug)]
 pub enum EncryptError {
@@ -79,6 +80,10 @@ impl DefaultEncrypter {
     pub fn decode_salt_bytes<'a>(&self, buf: &'a mut [u8; 16]) -> Result<&'a [u8]> {
         Ok(self.salt.decode_b64(buf)?)
     }
+
+    pub fn _salt(&self) -> SaltString {
+        self.salt.clone()
+    }
 }
 
 impl Encrypter for DefaultEncrypter {
@@ -105,34 +110,33 @@ pub trait Decrypter {
         &self,
         enc_bytes: &'a mut [u8],
         nonce_bytes: [u8; 12],
-        key_bytes: &mut Vec<u8>,
+        value_key_bytes: &mut Vec<u8>,
     ) -> Result<&'a mut [u8], DecryptError>;
 }
 
 #[derive(Debug, Clone)]
 pub struct DefaultDecrypter {
-    password: String,
     key: Option<Output>,
 }
 
 impl DefaultDecrypter {
     pub fn new(password: String, salt: SaltString) -> Self {
-        let mut dc = Self {
-            key: None,
-            password: password,
-        };
-        dc.derive_key(salt).expect("derive key");
-        dc
-    }
-
-    pub fn derive_key(&mut self, salt: SaltString) -> Result<(), KeyGenError> {
-        let key = Argon2::default().hash_password(self.password.as_bytes(), salt.as_salt())?;
-        self.key = Some(key.hash.ok_or(KeyGenError::HashMissing)?);
-        Ok(())
+        Self {
+            key: Some(Self::derive_key(salt, password.clone()).expect("derive key")),
+        }
     }
 
     pub fn encode_salt_string(salt_bytes: &[u8]) -> Result<SaltString> {
         Ok(SaltString::encode_b64(salt_bytes)?)
+    }
+
+    pub fn decode_salt_string(salt_string: &str) -> Result<SaltString> {
+        Ok(SaltString::from_b64(salt_string)?)
+    }
+
+    fn derive_key(salt: SaltString, password: String) -> Result<Output, KeyGenError> {
+        let key = Argon2::default().hash_password(password.as_bytes(), salt.as_salt())?;
+        Ok(key.hash.ok_or(KeyGenError::HashMissing)?)
     }
 }
 
@@ -141,10 +145,10 @@ impl Decrypter for DefaultDecrypter {
         &self,
         enc_bytes: &'a mut [u8],
         nonce_bytes: [u8; 12],
-        key_bytes: &mut Vec<u8>,
+        value_key_bytes: &mut Vec<u8>,
     ) -> Result<&'a mut [u8], DecryptError> {
         let nonce = NoncePlaceholder::from_bytes(nonce_bytes);
-        let aad = aead::Aad::from(&key_bytes);
+        let aad = aead::Aad::from(&value_key_bytes);
 
         if let Some(key) = self.key {
             let u_key = aead::UnboundKey::new(&aead::AES_256_GCM, key.as_bytes()).unwrap();

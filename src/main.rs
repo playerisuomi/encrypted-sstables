@@ -16,7 +16,7 @@ use std::{
     vec,
 };
 
-static DEFAULT: Lazy<String> = Lazy::new(|| String::new());
+static DEFAULT: Lazy<String> = Lazy::new(|| String::from("password"));
 
 #[allow(unused_assignments)]
 fn main() -> Result<(), KvError> {
@@ -27,14 +27,14 @@ fn main() -> Result<(), KvError> {
     let password = args.get(1).unwrap_or(&DEFAULT);
     let curr_dir = env::current_dir().expect("curr dir");
 
-    let mut hm: KvStore<String> = KvStore::new();
+    let encrypter = DefaultEncrypter::new(password.to_owned()).expect("no default encryption");
+    let mut hm: KvStore<String> = KvStore::new(encrypter.clone());
     let (tx, rx) = mpsc::channel::<BTreeMap<String, String>>();
 
-    let encrypter = DefaultEncrypter::new(password.to_owned()).expect("no default encryption");
     let encypter_guard = Arc::new(Mutex::new(encrypter));
 
     if let Ok(file) = File::open(curr_dir.join("wal.log")) {
-        hm.sync_wal(file).unwrap();
+        hm.sync_wal(file, password.clone()).unwrap();
     }
     let latest_segment = get_dir_segment_count(
         fs::read_dir(env::current_dir().expect("curr dir")).expect("show dir"),
@@ -89,7 +89,6 @@ fn main() -> Result<(), KvError> {
 
                 buf.extend_from_slice(&key_len.to_be_bytes());
                 buf.extend_from_slice(k.as_bytes());
-
                 // Nonce (12)
                 buf.extend_from_slice(&n);
                 // Cipher (..)
@@ -121,19 +120,21 @@ fn main() -> Result<(), KvError> {
                 .expect("unable to write");
             *seg_num = seg_num.add(1);
 
-            let mut log = log_handle_bg.lock().unwrap();
-            fs::remove_file(curr_dir_bg.join(format!("wal.log")).as_path()).unwrap();
-            let _ = std::mem::replace(
-                log.deref_mut(),
-                OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .append(true)
-                    .create(true)
-                    .open(curr_dir_bg.join(format!("wal.log")).as_path())
-                    .expect("New log file error"),
-            );
-
+            // TODO: a better approach?
+            {
+                let mut log = log_handle_bg.lock().unwrap();
+                fs::remove_file(curr_dir_bg.join(format!("wal.log")).as_path()).unwrap();
+                let _ = std::mem::replace(
+                    log.deref_mut(),
+                    OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .append(true)
+                        .create(true)
+                        .open(curr_dir_bg.join(format!("wal.log")).as_path())
+                        .expect("New log file error"),
+                );
+            }
             // Note: Merge segments...
         }
     });
@@ -152,14 +153,12 @@ fn main() -> Result<(), KvError> {
                 assert!(key_len <= u8::MAX as usize);
                 assert!(value_len <= u8::MAX as usize);
 
-                // TODO: encryption here!
-                let log_entry = format!("SET {} {}\n", k, v);
-                log_handle
-                    .lock()
-                    .unwrap()
-                    .write_all(log_entry.as_bytes())
-                    .expect("could not write contents");
-
+                hm.write_wal(
+                    k.to_string(),
+                    v.to_string(),
+                    log_handle.lock().unwrap().deref_mut(),
+                )
+                .expect("write wal");
                 hm.insert_parsed(k.to_string(), v.to_string())?;
 
                 let tx = tx.clone();
@@ -211,13 +210,14 @@ fn get_dir_segment_count(dir: ReadDir) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use enc_kv_store::encryption::DefaultEncrypter;
     use enc_kv_store::store::KvStore;
     use rand::Rng;
     use rand::distr::{Alphanumeric, Uniform};
 
     #[test]
     fn test_random_str_type_once() {
-        let mut hm = KvStore::new();
+        let mut hm = KvStore::new(DefaultEncrypter::new(String::new()).unwrap());
         // Custom function for "randoms" in KvStore?
         let (k, v): (String, usize) = (
             rand::rng()
