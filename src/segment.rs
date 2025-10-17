@@ -50,7 +50,7 @@ impl SegmentIter {
 }
 
 impl Iterator for SegmentIter {
-    type Item = SegmentFile<String, u64>;
+    type Item = SegmentFile;
 
     // Note: assumes a continuous sequence of segments without "gaps"
     fn next(&mut self) -> Option<Self::Item> {
@@ -81,14 +81,14 @@ impl Iterator for SegmentIter {
 }
 
 #[derive(Debug)]
-pub struct SegmentFile<K, V> {
+pub struct SegmentFile {
     seg_handle: File,
     idx_offset: u64,
-    idx: BTreeMap<K, V>,
+    idx: BTreeMap<String, u64>,
     decrypter: DefaultDecrypter,
 }
 
-impl SegmentFile<String, u64> {
+impl SegmentFile {
     pub fn new(offset: u64, seg_file: File, decrypter: DefaultDecrypter) -> Self {
         Self {
             idx: BTreeMap::new(),
@@ -98,7 +98,10 @@ impl SegmentFile<String, u64> {
         }
     }
 
-    fn search(&mut self, k: &str, key_offset: u64) -> Result<Option<String>> {
+    fn search<V>(&mut self, k: &str, key_offset: u64) -> Result<Option<V>>
+    where
+        V: bincode::Decode<()>,
+    {
         self.seg_handle.seek(std::io::SeekFrom::Start(key_offset))?;
         loop {
             if self.seg_handle.stream_position()? >= self.idx_offset {
@@ -127,9 +130,9 @@ impl SegmentFile<String, u64> {
                     .decrypter
                     .decrypt(&mut enc_bytes, nonce_bytes, &mut key_bytes)
                     .expect("no access");
-                // TODO: Serde deserialize!
-                let value = String::from_utf8(Vec::from(plaintext_slice))?;
-                return Ok(Some(value));
+                let value: (V, usize) =
+                    bincode::decode_from_slice(&plaintext_slice, bincode::config::standard())?;
+                return Ok(Some(value.0));
             }
             if key.as_str() > k {
                 return Ok(None);

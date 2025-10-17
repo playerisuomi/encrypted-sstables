@@ -1,12 +1,11 @@
-use base64::Engine;
-use base64::prelude::BASE64_STANDARD;
-
 use crate::encryption::DecryptError;
 use crate::encryption::Decrypter;
 use crate::encryption::DefaultDecrypter;
 use crate::encryption::DefaultEncrypter;
 use crate::encryption::EncryptError;
 use crate::encryption::Encrypter;
+use base64::Engine;
+use base64::prelude::BASE64_STANDARD;
 use core::fmt;
 use std::io::Read;
 use std::io::Write;
@@ -45,6 +44,18 @@ impl From<DecryptError> for KvError {
     }
 }
 
+impl From<bincode::error::EncodeError> for KvError {
+    fn from(_: bincode::error::EncodeError) -> Self {
+        KvError("Failed to encode")
+    }
+}
+
+impl From<bincode::error::DecodeError> for KvError {
+    fn from(_: bincode::error::DecodeError) -> Self {
+        KvError("Failed to decode")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct KvStore<V> {
     pub memtable: BTreeMap<String, V>,
@@ -53,7 +64,7 @@ pub struct KvStore<V> {
 
 impl<V> KvStore<V>
 where
-    V: FromStr, // Serialize + Deserialize
+    V: bincode::Decode<()> + FromStr,
 {
     pub fn new(encrypter: DefaultEncrypter /* for now, just default */) -> Self {
         Self {
@@ -64,8 +75,7 @@ where
 
     pub fn sync_wal(&mut self, mut file: File, password: String) -> Result<(), KvError>
     where
-        V: FromStr,
-        <V as FromStr>::Err: std::fmt::Debug,
+        V: bincode::Decode<()> + FromStr,
     {
         let mut buf = String::new();
         file.read_to_string(&mut buf).unwrap();
@@ -94,15 +104,14 @@ where
 
                     let log_decrypter = DefaultDecrypter::new(password.clone(), salt);
 
-                    let plaintext_bytes =
-                        log_decrypter.decrypt(enc_bytes, nonce_bytes, &mut key)?;
-                    let plaintext = String::from_utf8(plaintext_bytes.to_vec())
-                        .expect("decrypted a not valid string");
-
-                    if let Ok(value) = plaintext.parse::<V>() {
-                        self.memtable.insert(cmd_seq[1].to_string(), value);
-                    } else {
-                        return Err(KvError("sync wal"));
+                    if let Ok(plaintext_bytes) =
+                        log_decrypter.decrypt(enc_bytes, nonce_bytes, &mut key)
+                    {
+                        let (plain, _) = bincode::decode_from_slice(
+                            plaintext_bytes,
+                            bincode::config::standard(),
+                        )?;
+                        self.memtable.insert(cmd_seq[1].to_string(), plain);
                     }
                 }
                 _ => return Err(KvError("unknown cmd")),
@@ -111,12 +120,11 @@ where
         Ok(())
     }
 
-    pub fn write_wal(&self, k: String, v: String, file: &mut File) -> Result<(), KvError>
+    pub fn write_wal(&self, k: String, v: V, file: &mut File) -> Result<(), KvError>
     where
-        V: FromStr,
-        <V as FromStr>::Err: std::fmt::Debug,
+        V: bincode::Encode,
     {
-        let mut sealed_bytes = Vec::from(v.as_bytes());
+        let mut sealed_bytes = bincode::encode_to_vec(v, bincode::config::standard())?;
         let mut nonce = self
             .encrypter
             .encrypt(&mut sealed_bytes, Some(k.as_bytes()))?;
@@ -143,6 +151,6 @@ where
         } else {
             return Err(KvError("insert"));
         }
-        return Ok(());
+        Ok(())
     }
 }

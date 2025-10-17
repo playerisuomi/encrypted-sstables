@@ -4,7 +4,7 @@ A little learning project in Rust, systems concepts and cryptography.
 
 ## Testing
 
-#### Commands
+#### Running with flags
 
 ```powershell
 cargo run -- password
@@ -27,7 +27,6 @@ GET <key>
 ## Next
 
 - **Logging**
-- **Serde byte serialization**
 - Configuration
 - _Merge segments_
 - _App module for stdin loop_

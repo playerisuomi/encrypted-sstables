@@ -75,9 +75,12 @@ fn main() -> Result<(), KvError> {
 
             for (i, (k, v)) in flush_table.iter().enumerate() {
                 let offset = buf.len() as u64;
-                // TODO: Serde serialization -> derive Serialize and DeserializeOwned
-                // More generic method to serialize the value! -> might not be a String
-                let mut sealed_value: Vec<u8> = Vec::from(v.as_bytes());
+
+                // Note: manually set V -> String (KvStore)
+                let value: String = v.parse().expect("invalid value");
+                let mut sealed_value: Vec<u8> =
+                    bincode::encode_to_vec(value, bincode::config::standard()).expect("encoding");
+
                 let n = encrypter
                     .encrypt(&mut sealed_value, Some(k.as_bytes()))
                     .expect("encrypting a value-pair");
@@ -143,6 +146,7 @@ fn main() -> Result<(), KvError> {
                 assert!(key_len <= u8::MAX as usize);
                 assert!(value_len <= u8::MAX as usize);
 
+                // V is manually set to String
                 hm.write_wal(
                     k.to_string(),
                     v.to_string(),
