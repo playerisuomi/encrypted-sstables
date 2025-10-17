@@ -52,13 +52,13 @@ impl SegmentIter {
 impl Iterator for SegmentIter {
     type Item = SegmentFile<String, u64>;
 
+    // Note: assumes a continuous sequence of segments without "gaps"
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(curr) = self.curr.checked_sub(1) {
             self.curr = curr;
         } else {
             return None;
         }
-
         let seg_path = self
             .origin
             .join(format!("segment_{}.sstable", self.seg_ids[self.curr]));

@@ -20,7 +20,6 @@ cargo run -- password
 
 - **Logging**
 - **Serde byte serialization**
-- **Log encryption**
 - _Merge segments_
 - _App module for stdin loop?_
 - _Verify the loaded key against the saved key -> save the key hash?_

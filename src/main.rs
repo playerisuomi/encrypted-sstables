@@ -5,10 +5,11 @@ use enc_kv_store::segment::SegmentIter;
 use enc_kv_store::store::{KvError, KvStore};
 use enc_kv_store::{FOOTER_SIZE, MAX_MEMTABLE};
 use once_cell::sync::Lazy;
+use std::path::Path;
 use std::{
     collections::BTreeMap,
     env::{self},
-    fs::{self, File, OpenOptions, ReadDir},
+    fs::{self, File, OpenOptions},
     io::{Write, stdin},
     ops::{Add, DerefMut},
     sync::{Arc, Mutex, mpsc},
@@ -36,9 +37,8 @@ fn main() -> Result<(), KvError> {
     if let Ok(file) = File::open(curr_dir.join("wal.log")) {
         hm.sync_wal(file, password.clone()).unwrap();
     }
-    let latest_segment = get_dir_segment_count(
-        fs::read_dir(env::current_dir().expect("curr dir")).expect("show dir"),
-    );
+    let latest_segment = get_dir_segment_count(env::current_dir().expect("curr dir").as_path())
+        .expect("segment count");
 
     let seg_num: Arc<Mutex<usize>> = Arc::new(Mutex::new(latest_segment));
     let log_handle = Arc::new(Mutex::new(
@@ -75,8 +75,7 @@ fn main() -> Result<(), KvError> {
             let encrypter = encrypter_bg.lock().unwrap();
 
             for (i, (k, v)) in flush_table.iter().enumerate() {
-                let offset = buf.len() as u64; // could be u32
-
+                let offset = buf.len() as u64;
                 // TODO: Serde serialization -> derive Serialize and DeserializeOwned
                 // More generic method to serialize the value! -> might not be a String
                 let mut sealed_value: Vec<u8> = Vec::from(v.as_bytes());
@@ -120,21 +119,13 @@ fn main() -> Result<(), KvError> {
                 .expect("unable to write");
             *seg_num = seg_num.add(1);
 
-            // TODO: a better approach?
-            {
-                let mut log = log_handle_bg.lock().unwrap();
-                fs::remove_file(curr_dir_bg.join(format!("wal.log")).as_path()).unwrap();
-                let _ = std::mem::replace(
-                    log.deref_mut(),
-                    OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .append(true)
-                        .create(true)
-                        .open(curr_dir_bg.join(format!("wal.log")).as_path())
-                        .expect("New log file error"),
-                );
-            }
+            rotate_log_file(
+                &&log_handle_bg,
+                &curr_dir_bg.join("wal.log").as_path(),
+                &curr_dir_bg.join("archive").as_path(),
+            )
+            .expect("rotate log")
+
             // Note: Merge segments...
         }
     });
@@ -194,18 +185,42 @@ fn main() -> Result<(), KvError> {
     Ok(())
 }
 
-fn get_dir_segment_count(dir: ReadDir) -> usize {
-    dir.filter(|path_result| {
-        path_result
-            .as_ref()
-            .unwrap()
-            .file_name()
-            .as_os_str()
-            .to_str()
-            .unwrap()
-            .starts_with("segment_")
-    })
-    .count()
+fn rotate_log_file(
+    log_handle: &Arc<Mutex<File>>,
+    log_path: &Path,
+    archive_dir: &Path,
+) -> Result<()> {
+    let mut log_guard = log_handle.lock().unwrap();
+    fs::create_dir_all(archive_dir)?;
+
+    let archive_path = archive_dir.join("wal_log");
+    if log_path.exists() {
+        fs::rename(log_path, &archive_path)?;
+    }
+
+    let new_log_file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+
+    *log_guard = new_log_file;
+    Ok(())
+}
+
+fn get_dir_segment_count(dir_path: &Path) -> Result<usize> {
+    Ok(fs::read_dir(dir_path)?
+        .filter_map(|entry_result| {
+            let entry = entry_result.ok()?;
+            let file_name = entry.file_name();
+            let file_name_str = file_name.to_str()?;
+            if file_name_str.starts_with("segment_") {
+                Some(())
+            } else {
+                None
+            }
+        })
+        .count())
 }
 
 #[cfg(test)]
