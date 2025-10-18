@@ -1,42 +1,30 @@
-use crate::FOOTER_SIZE;
-use crate::MAX_MEMTABLE;
-use crate::encryption::DecryptError;
-use crate::encryption::Decrypter;
-use crate::encryption::DefaultDecrypter;
-use crate::encryption::DefaultEncrypter;
-use crate::encryption::EncryptError;
-use crate::encryption::Encrypter;
-use crate::segment::SegmentIter;
-use anyhow::Error;
-use anyhow::Result;
-use base64::Engine;
-use base64::prelude::BASE64_STANDARD;
+use crate::{
+    FOOTER_SIZE, INDEX_DENSITY, MAX_MEMTABLE,
+    encryption::{
+        DecryptError, Decrypter, DefaultDecrypter, DefaultEncrypter, EncryptError, Encrypter,
+    },
+    segment::SegmentIter,
+};
+use anyhow::{Error, Result};
+use base64::{Engine, prelude::BASE64_STANDARD};
 use core::fmt;
-use std::fmt::Debug;
-use std::fs;
-use std::fs::OpenOptions;
-use std::io::Read;
-use std::io::Write;
-use std::io::stdin;
-use std::ops::Add;
-use std::path::Path;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::mpsc;
-use std::sync::mpsc::Receiver;
-use std::sync::mpsc::SendError;
-use std::sync::mpsc::Sender;
 use std::{
     collections::BTreeMap,
-    fmt::{Display, Formatter},
-    fs::File,
+    fmt::{Debug, Display, Formatter},
+    fs::{self, File, OpenOptions},
+    io::{Read, Write, stdin},
+    ops::Add,
+    path::{Path, PathBuf},
     str::FromStr,
+    sync::{
+        Arc, Mutex,
+        mpsc::{self, Receiver, SendError, Sender},
+    },
 };
 
 #[derive(Debug)]
 pub struct KvStore<V> {
-    pub memtable: Arc<Mutex<BTreeMap<String, V>>>,
+    memtable: Arc<Mutex<BTreeMap<String, V>>>,
     encypter_guard: Arc<Mutex<DefaultEncrypter>>,
     seq_num: Arc<Mutex<usize>>,
     log_handle: Arc<Mutex<File>>,
@@ -165,7 +153,7 @@ where
                 buf.extend_from_slice(&cipher_len.to_be_bytes());
                 buf.extend_from_slice(sealed_bytes.as_slice());
 
-                if i % (flush_table.len() / 2) == 0 {
+                if i % (flush_table.len() / INDEX_DENSITY) == 0 {
                     idx.extend_from_slice(&key_len.to_be_bytes());
                     idx.extend_from_slice(k.as_bytes());
                     idx.extend_from_slice(&offset.to_be_bytes());
@@ -245,7 +233,7 @@ where
     {
         let (mut sealed_bytes, mut nonce) = self.build_entry(&k, &v)?;
 
-        let encrypter = self.encypter_guard.lock().expect("unable to aqcuire lock");
+        let encrypter = self.encypter_guard.lock().expect("unable to acquire lock");
         let mut salt_bytes: [u8; 16] = [0u8; 16];
         encrypter.get_salt_bytes(&mut salt_bytes)?;
 
@@ -321,7 +309,6 @@ impl Display for KvError {
 
 impl std::error::Error for KvError {}
 
-// For now
 impl From<std::io::Error> for KvError {
     fn from(_: std::io::Error) -> Self {
         KvError("IO error")

@@ -9,7 +9,7 @@ use std::{
     fs::{self},
 };
 
-static DEFAULT: Lazy<String> = Lazy::new(|| String::from("password"));
+static DEFAULT: Lazy<String> = Lazy::new(|| String::from("default"));
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();

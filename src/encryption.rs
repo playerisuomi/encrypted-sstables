@@ -13,57 +13,6 @@ use ring::aead::BoundKey;
 use ring::aead::{self, NonceSequence};
 use ring::error::Unspecified;
 
-#[derive(Debug)]
-pub enum EncryptError {
-    KeyError(Unspecified),
-}
-
-impl From<Unspecified> for EncryptError {
-    fn from(err: Unspecified) -> Self {
-        EncryptError::KeyError(err)
-    }
-}
-
-#[derive(Debug)]
-pub enum DecryptError {
-    KeyError(Unspecified),
-    KeyMissing,
-}
-
-impl Display for DecryptError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "DecryptError")
-    }
-}
-
-impl std::error::Error for DecryptError {}
-
-impl From<Unspecified> for DecryptError {
-    fn from(err: Unspecified) -> Self {
-        DecryptError::KeyError(err)
-    }
-}
-
-#[derive(Debug)]
-pub enum KeyGenError {
-    HashError(ArgonError),
-    HashMissing,
-}
-
-impl std::error::Error for KeyGenError {}
-
-impl Display for KeyGenError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "KeyGenError")
-    }
-}
-
-impl From<ArgonError> for KeyGenError {
-    fn from(err: ArgonError) -> Self {
-        KeyGenError::HashError(err)
-    }
-}
-
 pub trait Encrypter {
     fn encrypt(
         &self,
@@ -190,5 +139,56 @@ impl NoncePlaceholder {
 impl NonceSequence for NoncePlaceholder {
     fn advance(&mut self) -> std::result::Result<aead::Nonce, ring::error::Unspecified> {
         Ok(aead::Nonce::assume_unique_for_key(self.n))
+    }
+}
+
+#[derive(Debug)]
+pub enum EncryptError {
+    KeyError(Unspecified),
+}
+
+impl From<Unspecified> for EncryptError {
+    fn from(err: Unspecified) -> Self {
+        EncryptError::KeyError(err)
+    }
+}
+
+#[derive(Debug)]
+pub enum DecryptError {
+    KeyError(Unspecified),
+    KeyMissing,
+}
+
+impl Display for DecryptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DecryptError")
+    }
+}
+
+impl std::error::Error for DecryptError {}
+
+impl From<Unspecified> for DecryptError {
+    fn from(err: Unspecified) -> Self {
+        DecryptError::KeyError(err)
+    }
+}
+
+#[derive(Debug)]
+pub enum KeyGenError {
+    HashError(ArgonError),
+    HashMissing,
+}
+
+impl std::error::Error for KeyGenError {}
+
+impl Display for KeyGenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "KeyGenError")
+    }
+}
+
+impl From<ArgonError> for KeyGenError {
+    fn from(err: ArgonError) -> Self {
+        KeyGenError::HashError(err)
     }
 }

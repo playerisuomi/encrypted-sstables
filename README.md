@@ -1,13 +1,13 @@
 # enc-kv-store
 
-A little learning project in Rust, systems concepts and cryptography.
+A little learning project in Rust, systems concepts and cryptography. _Compacting feature is missing_.
 
 ## Testing
 
-#### Running with flags
+#### Running with flags (_set your own segment password_)
 
 ```powershell
-cargo run -- password
+make run PASS="password"
 ```
 
 #### Commands
@@ -22,7 +22,7 @@ GET <key>
 - Only able to access the segments that were decrypted with a certain password
 - SSTables -> background thread(pool) to merge
 - Main loop (on main thread) that listens for commands -> performs writes / reads with locks (`Arc<Mutex>`)
-- Background thread handles compaction and flushing (job queue)
+- Background thread should also handle compaction and flushing (job queue)
 
 ## Next
 
