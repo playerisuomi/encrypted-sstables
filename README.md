@@ -28,6 +28,7 @@ GET <key>
 
 - **Logging**
 - Configuration
+- Error brevity
 - _Merge segments_
 - _App module for stdin loop_
 - _Verify the loaded key against the saved key -> save the key hash_

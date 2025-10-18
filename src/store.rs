@@ -7,6 +7,7 @@ use crate::encryption::DefaultEncrypter;
 use crate::encryption::EncryptError;
 use crate::encryption::Encrypter;
 use crate::segment::SegmentIter;
+use anyhow::Error;
 use anyhow::Result;
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
@@ -24,6 +25,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
+use std::sync::mpsc::SendError;
 use std::sync::mpsc::Sender;
 use std::{
     collections::BTreeMap,
@@ -48,21 +50,20 @@ pub struct KvStore<V> {
 
 impl<V> KvStore<V>
 where
-    V: bincode::Decode<()> + FromStr + bincode::Encode + Send + Sync + Display,
+    V: bincode::Decode<()> + FromStr + bincode::Encode + Send + Sync + Display + 'static,
     <V as FromStr>::Err: Debug,
 {
-    pub fn new(password: String, latest_segment: usize, curr_dir: PathBuf) -> Self {
-        let encrypter = DefaultEncrypter::new(password.to_owned()).expect("no default encryption");
+    pub fn new(password: String, latest_segment: usize, curr_dir: PathBuf) -> Result<Self> {
+        let encrypter = DefaultEncrypter::new(password.to_owned())?;
         let (tx, rx) = mpsc::channel::<BTreeMap<String, V>>();
-        Self {
+        Ok(Self {
             log_handle: Arc::new(Mutex::new(
                 OpenOptions::new()
                     .read(true)
                     .write(true)
                     .append(true)
                     .create(true)
-                    .open(curr_dir.join(format!("wal.log")).as_path())
-                    .expect("New log file error"),
+                    .open(curr_dir.join(format!("wal.log")).as_path())?,
             )),
             seq_num: Arc::new(Mutex::new(latest_segment)),
             memtable: Arc::new(Mutex::new(BTreeMap::new())),
@@ -71,17 +72,22 @@ where
             password: password,
             curr_dir: curr_dir,
             flush_tx: tx,
-        }
+        })
     }
 
-    pub fn run(&self) -> Result<(), KvError> {
+    pub fn run(&self) -> Result<()>
+    where
+        <V as FromStr>::Err: std::error::Error,
+        <V as FromStr>::Err: Send,
+        <V as FromStr>::Err: Sync,
+    {
         if let Ok(file) = File::open(self.curr_dir.join("wal.log")) {
             self.sync_wal(file)?
         }
 
         let lines = stdin().lines();
         for line in lines {
-            let line = line.unwrap();
+            let line = line?;
             let cmd_seq: Vec<_> = line.split_whitespace().collect();
 
             match cmd_seq[0] {
@@ -93,15 +99,14 @@ where
                     assert!(key_len <= u8::MAX as usize);
                     assert!(value_len <= u8::MAX as usize);
 
-                    self.write_wal(k.to_string(), v.parse().expect("invalid value"))
-                        .expect("write wal");
+                    self.write_wal(k.to_string(), v.parse()?)?;
                     self.insert_parsed(k.to_string(), v.to_string())?;
 
                     let tx: mpsc::Sender<BTreeMap<String, V>> = self.flush_tx.clone();
                     let mut memtable = self.memtable.lock().expect("get mut");
                     if memtable.len() >= MAX_MEMTABLE {
-                        let flush_table: BTreeMap<String, _> = std::mem::take(&mut memtable);
-                        tx.send(flush_table).unwrap();
+                        let flush_table: BTreeMap<String, V> = std::mem::take(&mut memtable);
+                        tx.send(flush_table)?;
                     }
 
                     println!("SET done")
@@ -111,7 +116,7 @@ where
                     if let Some(val) = self.memtable.lock().expect("get lock").get(cmd_seq[1]) {
                         println!("GET -> {}", val)
                     } else {
-                        let curr_seg = self.seq_num.lock().unwrap().clone();
+                        let curr_seg = self.seq_num.lock().expect("lock seq num").clone();
 
                         let seg_iter = SegmentIter::new(
                             (0..curr_seg).into_iter().collect(),
@@ -125,36 +130,31 @@ where
                         }
                     }
                 }
-                _ => return Err(KvError("Unknown cmd")),
+                _ => return Err(Error::msg("Unknown cmd")),
             }
         }
         Ok(())
     }
 
-    pub fn run_bg_thread(&self) {
+    pub fn run_bg_thread(&self) -> Result<()> {
         let log_handle_bg = self.log_handle.clone();
         let seq_bg = self.seq_num.clone();
         let encrypter_bg = self.encypter_guard.clone();
 
         for flush_table in self.flush_rx.lock().expect("rx lock").iter() {
-            let mut seq_num = seq_bg.lock().unwrap();
-            let mut seq_handle = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .open(
-                    self.curr_dir
-                        .join(format!("segment_{}.sstable", seq_num))
-                        .as_path(),
-                )
-                .expect("New log file error");
+            let mut seq_num = seq_bg.lock().expect("lock seq num");
+            let mut seq_handle = OpenOptions::new().write(true).create(true).open(
+                self.curr_dir
+                    .join(format!("segment_{}.sstable", seq_num))
+                    .as_path(),
+            )?;
 
             let mut idx = Vec::new();
             let mut buf = Vec::new();
 
             for (i, (k, v)) in flush_table.iter().enumerate() {
                 let offset = buf.len() as u64;
-                let (sealed_bytes, nonce) =
-                    self.build_entry(&k, &v).expect("unable to build entry");
+                let (sealed_bytes, nonce) = self.build_entry(&k, &v)?;
 
                 let key_len: u32 = k.as_bytes().len() as u32;
                 let cipher_len: u32 = sealed_bytes.len() as u32;
@@ -179,33 +179,30 @@ where
             encrypter_bg
                 .lock()
                 .expect("encrypter lock")
-                .decode_salt_bytes(&mut salt_bytes)
-                .expect("salt decode");
+                .get_salt_bytes(&mut salt_bytes)?;
 
             footer[16..].copy_from_slice(&salt_bytes);
 
             buf.extend(&idx);
             buf.extend_from_slice(&footer);
 
-            seq_handle
-                .write_all(buf.as_slice())
-                .expect("unable to write");
+            seq_handle.write_all(buf.as_slice())?;
             *seq_num = seq_num.add(1);
 
             rotate_log_file(
                 &&log_handle_bg,
                 &self.curr_dir.join("wal.log").as_path(),
                 &self.curr_dir.join("archive").as_path(),
-            )
-            .expect("rotate log")
+            )?
 
             // Note: Merge segments...
         }
+        Ok(())
     }
 
-    pub fn sync_wal(&self, mut file: File) -> Result<(), KvError> {
+    pub fn sync_wal(&self, mut file: File) -> Result<()> {
         let mut buf = String::new();
-        file.read_to_string(&mut buf).unwrap();
+        file.read_to_string(&mut buf)?;
 
         for entry in buf.lines() {
             let cmd_seq: Vec<_> = entry.split_whitespace().collect();
@@ -213,18 +210,15 @@ where
                 "SET" => {
                     assert!(cmd_seq.len() == 5);
                     let mut key: Vec<u8> = Vec::from(cmd_seq[1].as_bytes());
-                    let mut enc_string: Vec<u8> =
-                        BASE64_STANDARD.decode(cmd_seq[2]).expect("decode value");
-                    let nonce: Vec<u8> = BASE64_STANDARD.decode(cmd_seq[3]).expect("decode nonce");
-                    let salt_bytes: Vec<u8> =
-                        BASE64_STANDARD.decode(cmd_seq[4]).expect("decode nonce");
+                    let mut enc_string: Vec<u8> = BASE64_STANDARD.decode(cmd_seq[2])?;
+                    let nonce: Vec<u8> = BASE64_STANDARD.decode(cmd_seq[3])?;
+                    let salt_bytes: Vec<u8> = BASE64_STANDARD.decode(cmd_seq[4])?;
 
                     let enc_bytes = enc_string.as_mut_slice();
-                    let nonce_bytes: [u8; 12] = nonce.try_into().expect("invalid nonce bytes");
-                    let salt = DefaultDecrypter::encode_salt_string(salt_bytes.as_slice())
-                        .expect("salt string conversion");
+                    let nonce_bytes: [u8; 12] = nonce.try_into().expect("invalid nonce"); // worthy panic
+                    let salt = DefaultDecrypter::encode_salt_string(salt_bytes.as_slice())?;
 
-                    let log_decrypter = DefaultDecrypter::new(self.password.clone(), salt);
+                    let log_decrypter = DefaultDecrypter::new(self.password.clone(), salt)?;
 
                     if let Ok(plaintext_bytes) =
                         log_decrypter.decrypt(enc_bytes, nonce_bytes, &mut key)
@@ -239,23 +233,21 @@ where
                             .insert(cmd_seq[1].to_string(), plain);
                     }
                 }
-                _ => return Err(KvError("unknown cmd")),
+                _ => return Err(Error::msg("unknown cmd")),
             };
         }
         Ok(())
     }
 
-    pub fn write_wal(&self, k: String, v: V) -> Result<(), KvError>
+    pub fn write_wal(&self, k: String, v: V) -> Result<()>
     where
         V: bincode::Encode,
     {
         let (mut sealed_bytes, mut nonce) = self.build_entry(&k, &v)?;
 
-        let encrypter = self.encypter_guard.lock().expect("enuable to aqcuire lock");
+        let encrypter = self.encypter_guard.lock().expect("unable to aqcuire lock");
         let mut salt_bytes: [u8; 16] = [0u8; 16];
-        encrypter
-            .decode_salt_bytes(&mut salt_bytes)
-            .expect("salt decode");
+        encrypter.get_salt_bytes(&mut salt_bytes)?;
 
         let encoded_string = BASE64_STANDARD.encode(&mut sealed_bytes);
         let nonce = BASE64_STANDARD.encode(&mut nonce);
@@ -301,7 +293,7 @@ fn rotate_log_file(
 ) -> Result<()> {
     fs::create_dir_all(archive_dir)?;
 
-    let mut log_guard = log_handle.lock().unwrap();
+    let mut log_guard = log_handle.lock().expect("lock log file handle");
     let archive_path = archive_dir.join("wal_log");
 
     if log_path.exists() {
@@ -327,10 +319,18 @@ impl Display for KvError {
     }
 }
 
+impl std::error::Error for KvError {}
+
 // For now
 impl From<std::io::Error> for KvError {
     fn from(_: std::io::Error) -> Self {
         KvError("IO error")
+    }
+}
+
+impl<V> From<SendError<BTreeMap<String, V>>> for KvError {
+    fn from(_: SendError<BTreeMap<String, V>>) -> Self {
+        KvError("placeholder")
     }
 }
 

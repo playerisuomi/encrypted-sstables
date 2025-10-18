@@ -27,8 +27,9 @@ impl SegmentIter {
     }
 
     pub fn find_key_in_segments(self, key: &str) -> Result<Option<String>> {
-        for mut seg in self {
+        for seg in self {
             let mut key_offset: u64 = 0;
+            let mut seg = seg?;
             for (k, v) in seg.idx.iter() {
                 match k.as_str().cmp(key) {
                     std::cmp::Ordering::Greater => break,
@@ -47,36 +48,36 @@ impl SegmentIter {
         }
         Ok(None)
     }
+
+    fn load_segment(&self, seg_path: &PathBuf) -> Result<SegmentFile> {
+        let mut seg_file = File::open(seg_path)?;
+        let (offset, size, salt) = SegmentFile::parse_footer(&mut seg_file)?;
+        let mut idx: Vec<u8> = vec![0; size.try_into()?];
+
+        let n = seg_file.seek_read(&mut idx, offset)?;
+        assert_eq!(size, n.try_into()?);
+
+        let file_decrypter = DefaultDecrypter::new(self.password.clone(), salt)?;
+        let mut seg = SegmentFile::new(offset, seg_file, file_decrypter);
+        seg.populate_index(idx)?;
+
+        Ok(seg)
+    }
 }
 
 impl Iterator for SegmentIter {
-    type Item = SegmentFile;
+    type Item = Result<SegmentFile>;
 
     // Note: assumes a continuous sequence of segments without "gaps"
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(curr) = self.curr.checked_sub(1) {
-            self.curr = curr;
-        } else {
-            return None;
-        }
+        let curr = self.curr.checked_sub(1)?;
+        self.curr = curr;
+
         let seg_path = self
             .origin
             .join(format!("segment_{}.sstable", self.seg_ids[self.curr]));
 
-        if let Ok(mut seg_file) = File::open(seg_path) {
-            let (offset, size, salt) = SegmentFile::parse_footer(&mut seg_file).unwrap();
-            let mut idx: Vec<u8> = vec![0; size.try_into().unwrap()];
-
-            let n = seg_file.seek_read(&mut idx, offset).unwrap();
-            assert_eq!(size, n.try_into().unwrap());
-
-            let file_decrypter = DefaultDecrypter::new(self.password.clone(), salt);
-            let mut seg = SegmentFile::new(offset, seg_file, file_decrypter);
-            seg.populate_index(idx).unwrap();
-
-            return Some(seg);
-        }
-        None
+        Some(self.load_segment(&seg_path))
     }
 }
 
@@ -126,10 +127,9 @@ impl SegmentFile {
 
             let key = String::from_utf8(key_bytes.clone())?;
             if key.as_str() == k {
-                let plaintext_slice = self
-                    .decrypter
-                    .decrypt(&mut enc_bytes, nonce_bytes, &mut key_bytes)
-                    .expect("no access");
+                let plaintext_slice =
+                    self.decrypter
+                        .decrypt(&mut enc_bytes, nonce_bytes, &mut key_bytes)?;
                 let value: (V, usize) =
                     bincode::decode_from_slice(&plaintext_slice, bincode::config::standard())?;
                 return Ok(Some(value.0));
@@ -171,8 +171,7 @@ impl SegmentFile {
         let idx_size = u64::from_be_bytes(footer_bytes[8..16].try_into()?);
 
         let salt_bytes = &footer_bytes[16..];
-        let salt =
-            DefaultDecrypter::encode_salt_string(salt_bytes).expect("encode salt back to string");
+        let salt = DefaultDecrypter::encode_salt_string(salt_bytes)?;
 
         Ok((idx_offset, idx_size, salt))
     }

@@ -1,4 +1,4 @@
-use std::sync::LazyLock;
+use std::fmt::Display;
 
 use anyhow::Result;
 use argon2::PasswordHasher;
@@ -12,9 +12,6 @@ use rand::TryRngCore;
 use ring::aead::BoundKey;
 use ring::aead::{self, NonceSequence};
 use ring::error::Unspecified;
-
-pub static SALT: LazyLock<SaltString> =
-    std::sync::LazyLock::new(|| SaltString::generate(&mut OsRng));
 
 #[derive(Debug)]
 pub enum EncryptError {
@@ -33,6 +30,14 @@ pub enum DecryptError {
     KeyMissing,
 }
 
+impl Display for DecryptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DecryptError")
+    }
+}
+
+impl std::error::Error for DecryptError {}
+
 impl From<Unspecified> for DecryptError {
     fn from(err: Unspecified) -> Self {
         DecryptError::KeyError(err)
@@ -43,6 +48,14 @@ impl From<Unspecified> for DecryptError {
 pub enum KeyGenError {
     HashError(ArgonError),
     HashMissing,
+}
+
+impl std::error::Error for KeyGenError {}
+
+impl Display for KeyGenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "KeyGenError")
+    }
 }
 
 impl From<ArgonError> for KeyGenError {
@@ -68,21 +81,18 @@ pub struct DefaultEncrypter {
 
 impl DefaultEncrypter {
     pub fn new(password: String) -> Result<Self, KeyGenError> {
-        let key = Argon2::default().hash_password(password.as_bytes(), SALT.as_salt())?;
+        let salt = SaltString::generate(&mut OsRng);
+        let key = Argon2::default().hash_password(password.as_bytes(), salt.as_salt())?;
         let key_output = key.hash.ok_or(KeyGenError::HashMissing)?;
         Ok(Self {
             key: key_output.to_owned(),
             password,
-            salt: SALT.to_owned(),
+            salt: salt.to_owned(),
         })
     }
 
-    pub fn decode_salt_bytes<'a>(&self, buf: &'a mut [u8; 16]) -> Result<&'a [u8]> {
+    pub fn get_salt_bytes<'a>(&self, buf: &'a mut [u8; 16]) -> Result<&'a [u8]> {
         Ok(self.salt.decode_b64(buf)?)
-    }
-
-    pub fn _salt(&self) -> SaltString {
-        self.salt.clone()
     }
 }
 
@@ -116,14 +126,13 @@ pub trait Decrypter {
 
 #[derive(Debug, Clone)]
 pub struct DefaultDecrypter {
-    key: Option<Output>,
+    key: Output,
 }
 
 impl DefaultDecrypter {
-    pub fn new(password: String, salt: SaltString) -> Self {
-        Self {
-            key: Some(Self::derive_key(salt, password.clone()).expect("derive key")),
-        }
+    pub fn new(password: String, salt: SaltString) -> Result<Self> {
+        let key = Self::derive_key(salt, password.clone())?;
+        Ok(Self { key: key })
     }
 
     pub fn encode_salt_string(salt_bytes: &[u8]) -> Result<SaltString> {
@@ -150,13 +159,11 @@ impl Decrypter for DefaultDecrypter {
         let nonce = NoncePlaceholder::from_bytes(nonce_bytes);
         let aad = aead::Aad::from(&value_key_bytes);
 
-        if let Some(key) = self.key {
-            let u_key = aead::UnboundKey::new(&aead::AES_256_GCM, key.as_bytes()).unwrap();
-            let mut opening_key = aead::OpeningKey::new(u_key, nonce.clone());
-            let plaintext = opening_key.open_in_place(aad, enc_bytes)?;
-            return Ok(plaintext);
-        }
-        Err(DecryptError::KeyMissing)
+        let u_key = aead::UnboundKey::new(&aead::AES_256_GCM, self.key.as_bytes()).unwrap();
+        let mut opening_key = aead::OpeningKey::new(u_key, nonce.clone());
+        let plaintext = opening_key.open_in_place(aad, enc_bytes)?;
+
+        return Ok(plaintext);
     }
 }
 
@@ -171,7 +178,7 @@ impl NoncePlaceholder {
         let mut nonce = [0u8; aead::NONCE_LEN];
         rand::rngs::OsRng
             .try_fill_bytes(&mut nonce)
-            .expect("unable to gen nonce");
+            .expect("unable to gen nonce"); // worthy panic
         Self { n: nonce }
     }
 
