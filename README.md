@@ -19,6 +19,7 @@ GET <key>
 
 ## Notes
 
+- _Edited from elsewhere_
 - Only able to access the segments that were decrypted with a certain password
 - SSTables -> background thread(pool) to merge
 - Main loop (on main thread) that listens for commands -> performs writes / reads with locks (`Arc<Mutex>`)
